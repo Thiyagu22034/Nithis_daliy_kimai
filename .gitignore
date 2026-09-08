@@ -1,0 +1,7 @@
+_kimai_runner_config.json
+_kimai_runner_state.json
+_kimai_runner_stop
+_kimai_runner.log
+.~*.tmp.xlsx
+__pycache__/
+*.pyc

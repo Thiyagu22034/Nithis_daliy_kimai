@@ -1,0 +1,7 @@
+# Kimai Timesheet Syncer
+streamlit>=1.63.0
+pandas>=2.3.3
+requests>=2.32.5
+openpyxl>=3.1.5
+# Optional — only needed if "Refine task descriptions with Gemini" is enabled
+google-genai>=2.22.0
