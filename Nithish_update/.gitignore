@@ -2,6 +2,8 @@ _kimai_runner_config.json
 _kimai_runner_state.json
 _kimai_runner_stop
 _kimai_runner.log
+_kimai_share_cache/
+_kimai_share_map.json
 .~*.tmp.xlsx
 __pycache__/
 *.pyc

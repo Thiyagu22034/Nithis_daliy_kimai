@@ -4,14 +4,18 @@ Used by the UI and by the background worker process.
 """
 from __future__ import annotations
 
+import base64
 import ctypes
+import hashlib
 import io
+import json
 import os
 import re
 import time
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import pandas as pd
 import requests
@@ -22,6 +26,16 @@ PERMISSION_HINT = (
 )
 
 LogFn = Callable[[str], None]
+
+_CORE_DIR = os.path.dirname(os.path.abspath(__file__))
+_SHARE_CACHE_DIR = os.path.join(_CORE_DIR, "_kimai_share_cache")
+_SHARE_MAP_PATH = os.path.join(_CORE_DIR, "_kimai_share_map.json")
+_SHARE_CACHE_TTL_SECONDS = 45
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+_EXCEL_NAME_RE = re.compile(r"\.(xlsx|xlsm|xls)$", re.I)
 
 
 def _log(msg: str, log: LogFn | None = None) -> None:
@@ -188,23 +202,398 @@ def write_excel_safely(df: pd.DataFrame, path: str) -> None:
     ) from last_err
 
 
-def resolve_excel_path(path_or_url: str, label: str = "Excel"):
-    path_or_url = (path_or_url or "").strip()
+def clean_path_or_url(value: str) -> str:
+    return (value or "").strip().strip('"').strip("'").strip()
+
+
+def is_excel_filename(name: str | None) -> bool:
+    return bool(name) and bool(_EXCEL_NAME_RE.search(name or ""))
+
+
+def _safe_filename(name: str) -> str:
+    name = os.path.basename(name or "").strip() or "workbook.xlsx"
+    name = re.sub(r'[<>:"/\\|?*]+', "_", name)
+    if not is_excel_filename(name):
+        name = f"{name}.xlsx"
+    return name
+
+
+def _with_download_param(url: str) -> str:
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    qs.pop("web", None)
+    qs["download"] = ["1"]
+    return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+
+def _encode_sharing_url(url: str) -> str:
+    raw = base64.b64encode(url.encode("utf-8")).decode("ascii")
+    return "u!" + raw.rstrip("=").replace("/", "_").replace("+", "-")
+
+
+def parse_sharepoint_file_from_url(url: str) -> tuple[str | None, str | None]:
+    """Return (OneDrive-relative path, filename) if the URL contains them."""
+    if not url:
+        return None, None
+    parsed = urlparse(url.strip())
+    path = unquote(parsed.path or "")
+    rel = None
+    fname = None
+
+    m = re.search(r"/Documents/(.+\.(?:xlsx|xlsm|xls))$", path, re.I)
+    if m:
+        rel = m.group(1).replace("/", os.sep)
+        fname = os.path.basename(rel)
+    else:
+        m = re.search(r"/Shared Documents/(.+\.(?:xlsx|xlsm|xls))$", path, re.I)
+        if m:
+            rel = unquote(m.group(1)).replace("/", os.sep)
+            fname = os.path.basename(rel)
+        elif is_excel_filename(os.path.basename(path)):
+            fname = os.path.basename(path)
+
+    qs = parse_qs(parsed.query)
+    for key in ("file", "fileName", "filename"):
+        values = qs.get(key) or []
+        if values and is_excel_filename(unquote(values[0])):
+            fname = fname or unquote(values[0])
+            break
+    return rel, fname
+
+
+def share_download_candidates(url: str) -> list[str]:
+    url = url.strip()
+    parsed = urlparse(url)
+    path = unquote(parsed.path or "")
+    host = parsed.netloc
+    e = (parse_qs(parsed.query).get("e") or [""])[0]
+    out = [url, _with_download_param(url)]
+
+    m = re.match(r"/:[a-z]:/g/personal/([^/]+)/([^/]+)/?$", path, re.I)
+    if m:
+        user, share = m.group(1), m.group(2)
+        out.append(f"https://{host}/personal/{user}/_layouts/15/download.aspx?share={share}")
+        if e:
+            out.append(
+                f"https://{host}/personal/{user}/_layouts/15/download.aspx?share={share}&e={e}"
+            )
+            out.append(
+                f"https://{host}/_layouts/15/guestaccess.aspx?share={share}&e={e}&download=1"
+            )
+
+    m = re.match(r"/:[a-z]:/s/([^/]+)/([^/]+)/?$", path, re.I)
+    if m:
+        site, share = m.group(1), m.group(2)
+        out.append(
+            f"https://{host}/sites/{site}/_layouts/15/guestaccess.aspx?share={share}&download=1"
+        )
+        if e:
+            out.append(
+                f"https://{host}/sites/{site}/_layouts/15/guestaccess.aspx?share={share}&e={e}&download=1"
+            )
+
+    return list(dict.fromkeys(out))
+
+
+def _looks_like_excel_bytes(data: bytes) -> bool:
+    if not data or len(data) < 4:
+        return False
+    if data[:2] == b"PK":
+        return True
+    return data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _filename_from_disposition(header: str | None) -> str | None:
+    if not header:
+        return None
+    m = re.search(r"filename\*=(?:UTF-8'')([^;]+)", header, re.I)
+    if m:
+        name = unquote(m.group(1).strip().strip('"'))
+        return name if is_excel_filename(name) else None
+    m = re.search(r'filename="?([^";]+)"?', header, re.I)
+    if m:
+        name = unquote(m.group(1).strip())
+        return name if is_excel_filename(name) else None
+    return None
+
+
+def _share_cache_dir(url: str) -> str:
+    digest = hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:16]
+    return os.path.join(_SHARE_CACHE_DIR, digest)
+
+
+def _existing_cache_file(url: str) -> str | None:
+    folder = _share_cache_dir(url)
+    if not os.path.isdir(folder):
+        return None
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and is_excel_filename(name):
+            return path
+    return None
+
+
+def _cache_is_fresh(path: str) -> bool:
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False
+    return age <= _SHARE_CACHE_TTL_SECONDS
+
+
+def _load_share_map() -> dict:
+    if not os.path.isfile(_SHARE_MAP_PATH):
+        return {}
+    try:
+        with open(_SHARE_MAP_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _remember_share_mapping(url: str, local_path: str) -> None:
+    try:
+        mapping = _load_share_map()
+        mapping[url.strip()] = os.path.abspath(local_path)
+        with open(_SHARE_MAP_PATH, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2)
+    except Exception:
+        pass
+
+
+def _mapped_local_path(url: str, allow_missing: bool = False) -> str | None:
+    path = _load_share_map().get(url.strip())
+    if not path:
+        return None
+    if os.path.isfile(path):
+        return path
+    if allow_missing and os.path.isdir(os.path.dirname(path) or "."):
+        return path
+    return None
+
+
+def fetch_share_drive_item(url: str) -> dict:
+    encoded = _encode_sharing_url(url)
+    host = urlparse(url).netloc
+    endpoints = [
+        f"https://{host}/_api/v2.0/shares/{encoded}/driveItem",
+    ]
+    headers = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
+    for api in endpoints:
+        try:
+            res = requests.get(api, headers=headers, timeout=8)
+        except Exception:
+            continue
+        if res.status_code != 200:
+            continue
+        try:
+            data = res.json()
+        except Exception:
+            continue
+        item = data.get("driveItem") or data
+        if isinstance(item, dict) and (item.get("name") or item.get("webUrl")):
+            return item
+    return {}
+
+
+def download_share_excel(url: str) -> tuple[bytes | None, str | None, str | None]:
+    headers = {"User-Agent": _BROWSER_UA, "Accept": "*/*"}
+    for candidate in share_download_candidates(url):
+        try:
+            res = requests.get(candidate, headers=headers, allow_redirects=True, timeout=20)
+        except Exception:
+            continue
+        data = res.content or b""
+        if res.status_code == 200 and _looks_like_excel_bytes(data):
+            name = _filename_from_disposition(res.headers.get("Content-Disposition"))
+            if not name:
+                _, name = parse_sharepoint_file_from_url(res.url)
+            return data, name or "workbook.xlsx", res.url
+        _rel, final_name = parse_sharepoint_file_from_url(res.url)
+        if _rel or final_name:
+            return None, final_name, res.url
+    return None, None, None
+
+
+def find_local_excel_named(filename: str, hint_rel: str | None = None) -> str | None:
+    filename_l = (filename or "").strip().lower()
+    if not filename_l:
+        return None
+    hint_folder = os.path.dirname(hint_rel).replace("/", os.sep) if hint_rel else ""
+    hits: list[str] = []
+    for root in find_onedrive_roots():
+        if hint_rel:
+            preferred = os.path.join(root, hint_rel)
+            if os.path.isfile(preferred):
+                return preferred
+        if hint_folder:
+            preferred_dir = os.path.join(root, hint_folder, os.path.basename(filename))
+            if os.path.isfile(preferred_dir):
+                return preferred_dir
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel = os.path.relpath(dirpath, root)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if depth > 6:
+                dirnames.clear()
+                continue
+            for name in filenames:
+                if name.lower() == filename_l:
+                    hits.append(os.path.join(dirpath, name))
+    if hint_folder:
+        folder_l = hint_folder.lower()
+        hinted = [h for h in hits if folder_l in h.lower()]
+        if hinted:
+            return hinted[0]
+    return hits[0] if hits else None
+
+
+def local_path_from_share_info(rel: str | None, filename: str | None, *, allow_missing: bool):
+    if rel:
+        for root in find_onedrive_roots():
+            candidate = os.path.join(root, rel)
+            if os.path.isfile(candidate):
+                return candidate
+            parent = os.path.dirname(candidate)
+            if allow_missing and parent and os.path.isdir(parent):
+                return candidate
+    if filename:
+        found = find_local_excel_named(filename, rel)
+        if found:
+            return found
+        if allow_missing and rel:
+            for root in find_onedrive_roots():
+                candidate = os.path.join(root, rel)
+                parent = os.path.dirname(candidate)
+                if parent and os.path.isdir(parent):
+                    return candidate
+    return None
+
+
+def _write_share_cache(url: str, data: bytes, filename: str) -> str:
+    folder = _share_cache_dir(url)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, _safe_filename(filename))
+    with open(path, "wb") as f:
+        f.write(data)
+    return os.path.abspath(path)
+
+
+def resolve_share_or_http_excel(
+    url: str, label: str, *, force_refresh: bool = False
+) -> tuple[str | None, str | None]:
+    is_backup = label.lower().startswith("backup")
+    rel, fname = parse_sharepoint_file_from_url(url)
+    mapped = _mapped_local_path(url, allow_missing=is_backup)
+    local = mapped or local_path_from_share_info(rel, fname, allow_missing=is_backup)
+
+    if local and os.path.isfile(local):
+        _remember_share_mapping(url, local)
+        return os.path.abspath(local), None
+    if is_backup and local:
+        parent = os.path.dirname(os.path.abspath(local))
+        if os.path.isdir(parent) or parent == ".":
+            _remember_share_mapping(url, local)
+            return os.path.abspath(local), None
+
+    cached = _existing_cache_file(url)
+    if is_backup and cached:
+        return cached, None
+    if cached and not is_backup and not force_refresh and _cache_is_fresh(cached):
+        return cached, None
+
+    item = fetch_share_drive_item(url)
+    web_url = str(item.get("webUrl") or "")
+    if web_url:
+        rel2, fname2 = parse_sharepoint_file_from_url(web_url)
+        rel = rel or rel2
+        fname = fname or fname2
+    name = item.get("name")
+    if is_excel_filename(str(name or "")):
+        fname = fname or str(name)
+        parent = (item.get("parentReference") or {}).get("path") or ""
+        if isinstance(parent, str) and ":/" in parent:
+            folder = parent.split(":/", 1)[-1].strip("/")
+            if folder:
+                rel = rel or os.path.join(*folder.split("/"), str(name))
+
+    if not local:
+        local = local_path_from_share_info(rel, fname, allow_missing=is_backup)
+        if local and os.path.isfile(local):
+            _remember_share_mapping(url, local)
+            return os.path.abspath(local), None
+
+    data, dl_name, final_url = download_share_excel(url)
+    if final_url:
+        rel3, fname3 = parse_sharepoint_file_from_url(final_url)
+        rel = rel or rel3
+        fname = fname or fname3 or dl_name
+    elif dl_name:
+        fname = fname or dl_name
+
+    if not local:
+        local = local_path_from_share_info(rel, fname, allow_missing=is_backup)
+
+    if data and local:
+        parent = os.path.dirname(local)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if not os.path.isfile(local):
+            with open(local, "wb") as f:
+                f.write(data)
+        _remember_share_mapping(url, local)
+        return os.path.abspath(local), None
+
+    if local and os.path.isfile(local):
+        _remember_share_mapping(url, local)
+        return os.path.abspath(local), None
+    if is_backup and local:
+        parent = os.path.dirname(os.path.abspath(local))
+        if not os.path.isdir(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                return None, f"Backup folder does not exist: `{parent}`"
+        _remember_share_mapping(url, local)
+        return os.path.abspath(local), None
+
+    if data:
+        path = _write_share_cache(
+            url,
+            data,
+            fname or dl_name or ("backup.xlsx" if is_backup else "input.xlsx"),
+        )
+        _remember_share_mapping(url, path)
+        return path, None
+
+    if cached:
+        return cached, None
+
+    if is_backup:
+        folder = _share_cache_dir(url)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, _safe_filename(fname or "Timesheet_Backup.xlsx"))
+        _remember_share_mapping(url, path)
+        return os.path.abspath(path), None
+
+    return None, (
+        f"{label}: could not open this SharePoint/OneDrive link. "
+        "Paste a Copy link to that .xlsx file (anyone-with-the-link, or a file already synced in OneDrive), "
+        "or paste the local .xlsx path. Each link is used as its own file."
+    )
+
+
+def resolve_excel_path(
+    path_or_url: str, label: str = "Excel", *, force_refresh: bool = False
+):
+    path_or_url = clean_path_or_url(path_or_url)
     if not path_or_url:
         return None, f"No {label} path provided."
 
     is_backup = label.lower().startswith("backup")
 
     if is_http_url(path_or_url):
-        local_input = find_local_timesheet()
-        if not local_input:
-            return None, (
-                f"{label}: SharePoint link needs a synced local OneDrive file. "
-                "Paste the local .xlsx path instead."
-            )
-        if is_backup:
-            return os.path.join(os.path.dirname(local_input), "Timesheet_Backup.xlsx"), None
-        return local_input, None
+        return resolve_share_or_http_excel(path_or_url, label, force_refresh=force_refresh)
 
     if is_backup:
         parent = os.path.dirname(os.path.abspath(path_or_url)) or "."
@@ -526,7 +915,9 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
         err("Missing Kimai Base URL or API Token.")
         return result
 
-    resolved_path, resolve_error = resolve_excel_path(input_excel_path, "Input")
+    resolved_path, resolve_error = resolve_excel_path(
+        input_excel_path, "Input", force_refresh=True
+    )
     backup_path, backup_error = resolve_excel_path(backup_excel_path, "Backup")
     if not resolved_path:
         err(resolve_error or f"Input file not found: {input_excel_path}")

@@ -333,6 +333,9 @@ st.caption(
     "Excel **Tasks** → Kimai **Description**. "
     "**Ticket ID** is not used for Kimai (kept only in Backup). "
     "Full input rows are joined into your **Backup** path after sync. "
+    "Input and Backup accept a local `.xlsx` path **or a SharePoint/OneDrive Copy link** "
+    "(for example `https://…sharepoint.com/:x:/g/…`). Each pasted link is opened as **that** file — "
+    "not a fixed Timesheet.xlsx. "
     "If Tasks is **leave**, Kimai uses project **General Operations** and activity **Leave**. "
     "If Tasks is **Permission**, Kimai uses project **General Operations** and activity **Permission**. "
     "If a weekday’s **Hours Spent** total is under **8**, the remaining hours are added as "
@@ -345,11 +348,13 @@ with col_p1:
     input_excel_path = st.text_input(
         "Input data Excel path",
         value=r"C:\Users\Thiyagu.Sekar\OneDrive - Eurolandcom AB\nithis_doc\Timesheet.xlsx",
+        placeholder="Local .xlsx path or SharePoint Copy link",
     )
 with col_p2:
     backup_excel_path = st.text_input(
         "Backup Excel path",
         value=r"C:\Users\Thiyagu.Sekar\OneDrive - Eurolandcom AB\nithis_doc\Timesheet_Backup.xlsx",
+        placeholder="Local .xlsx path or SharePoint Copy link",
     )
 
 resolved_input_path, resolve_err = resolve_excel_path(input_excel_path, "Input")
@@ -362,7 +367,10 @@ if resolved_input_path and resolved_backup_path:
         backup_err = "Backup path must differ from Input path."
 
 if resolved_backup_path:
-    st.caption(f"Backup target: `{resolved_backup_path}`")
+    if is_http_url(backup_excel_path):
+        st.caption(f"Backup SharePoint/OneDrive link → `{resolved_backup_path}`")
+    else:
+        st.caption(f"Backup target: `{resolved_backup_path}`")
 
 if resolved_input_path:
     try:
@@ -455,7 +463,10 @@ if resolved_input_path:
                 )
 
             if is_http_url(input_excel_path):
-                st.success(f"SharePoint link → `{resolved_input_path}` ({len(input_df)} records).")
+                st.success(
+                    f"SharePoint/OneDrive link opened → `{resolved_input_path}` "
+                    f"({len(input_df)} records)."
+                )
             else:
                 st.success(f"Input file found: `{resolved_input_path}` — {len(input_df)} records.")
             st.caption(f"Kimai Description is taken from Excel column **{col_tasks}**.")
