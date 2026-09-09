@@ -46,6 +46,15 @@ st.caption(
     "**End** is the only way to stop it."
 )
 
+if "flash" not in st.session_state:
+    st.session_state.flash = None
+if "last_once_result" not in st.session_state:
+    st.session_state.last_once_result = None
+if "last_once_at" not in st.session_state:
+    st.session_state.last_once_at = None
+if "celebrated_add_fp" not in st.session_state:
+    st.session_state.celebrated_add_fp = None
+
 
 def load_state() -> dict:
     if not os.path.isfile(STATE_PATH):
@@ -192,6 +201,79 @@ def stop_worker() -> tuple[bool, str]:
     return True, "Worker stopped."
 
 
+def _as_int(value, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_newer(stamp_a: str | None, stamp_b: str | None) -> bool:
+    if not stamp_a:
+        return False
+    if not stamp_b:
+        return True
+    return stamp_a > stamp_b
+
+
+def kimai_add_banner(result: dict | None) -> tuple[str, str] | None:
+    """Return (kind, message) for a Kimai add result."""
+    if not result:
+        return None
+    uploaded = _as_int(result.get("uploaded"))
+    skipped = _as_int(result.get("skipped_existing"))
+    failed = _as_int(result.get("failed"))
+    backup = _as_int(result.get("newly_backed_up"))
+    ok = bool(result.get("ok"))
+    extras = []
+    if skipped:
+        extras.append(f"{skipped} already existed")
+    if failed:
+        extras.append(f"{failed} failed")
+    if backup:
+        extras.append(f"backup +{backup}")
+    extra_text = f" ({', '.join(extras)})" if extras else ""
+    if ok and uploaded > 0:
+        return (
+            "success",
+            f"**Successfully added to Kimai.** {uploaded} new timesheet(s) saved{extra_text}.",
+        )
+    if ok:
+        if extras:
+            return ("info", f"Kimai sync completed. No new timesheets were added{extra_text}.")
+        return ("info", "Kimai sync completed. No new timesheets were added.")
+    return ("error", "Kimai add failed. Check the details below.")
+
+
+def render_alert(kind: str, text: str) -> None:
+    if kind == "success":
+        st.success(text)
+    elif kind == "error":
+        st.error(text)
+    else:
+        st.info(text)
+
+
+def render_kimai_add_result(result: dict | None, *, toast_key: str | None = None) -> None:
+    if not result:
+        return
+    if result.get("missing_projects"):
+        st.error(
+            "Project value not found in Kimai:\n\n"
+            + "\n".join(f"- {m}" for m in result["missing_projects"])
+        )
+    banner = kimai_add_banner(result)
+    if banner:
+        render_alert(*banner)
+        if banner[0] == "success" and toast_key:
+            if st.session_state.celebrated_add_fp != toast_key:
+                st.session_state.celebrated_add_fp = toast_key
+                st.toast("Successfully added to Kimai", icon="✅")
+                st.balloons()
+    for e in (result.get("errors") or [])[:10]:
+        st.code(e)
+
+
 # --- Status banner ---
 running, runner_state = is_worker_running()
 if running:
@@ -202,6 +284,24 @@ if running:
     )
 else:
     st.info("Background sync is **STOPPED**. Fill settings below, then click **Start**.")
+
+flash = st.session_state.pop("flash", None)
+if flash:
+    render_alert(flash[0], flash[1])
+
+once_result = st.session_state.get("last_once_result")
+once_at = st.session_state.get("last_once_at")
+worker_result = runner_state.get("last_result")
+worker_at = runner_state.get("updated_at")
+if once_result and _is_newer(once_at, worker_at):
+    render_kimai_add_result(once_result, toast_key=f"once:{once_at}")
+elif worker_result:
+    render_kimai_add_result(
+        worker_result,
+        toast_key=f"cycle:{runner_state.get('cycle')}:{worker_at}",
+    )
+elif once_result:
+    render_kimai_add_result(once_result, toast_key=f"once:{once_at}")
 
 # --- 1. API CONFIGURATIONS ---
 st.header("1. API Configuration")
@@ -465,49 +565,29 @@ with col_once:
 
 if start_clicked:
     if not kimai_url or not kimai_token:
-        st.error("Enter Kimai Base URL and API Token before Start.")
+        st.session_state.flash = (
+            "error",
+            "Enter Kimai Base URL and API Token before Start.",
+        )
     else:
         ok, msg = start_worker(config)
-        if ok:
-            st.success(msg)
-            st.rerun()
-        else:
-            st.error(msg)
+        st.session_state.flash = ("success" if ok else "error", msg)
+    st.rerun()
 
 if end_clicked:
     ok, msg = stop_worker()
-    if ok:
-        st.success(msg)
-        st.rerun()
-    else:
-        st.error(msg)
+    st.session_state.flash = ("success" if ok else "error", msg)
+    st.rerun()
 
 if once_clicked:
     if not kimai_url or not kimai_token:
-        st.error("Enter Kimai Base URL and API Token.")
+        st.session_state.flash = ("error", "Enter Kimai Base URL and API Token.")
     else:
         with st.spinner("Running one sync cycle..."):
             result = run_sync(config)
-        if result.get("missing_projects"):
-            st.error(
-                "Project value not found in Kimai:\n\n"
-                + "\n".join(f"- {m}" for m in result["missing_projects"])
-            )
-        if result.get("ok"):
-            st.success(
-                f"Kimai updated — uploaded={result.get('uploaded', 0)}, "
-                f"already={result.get('skipped_existing', 0)}, "
-                f"failed={result.get('failed', 0)}, "
-                f"backup+={result.get('newly_backed_up', 0)}"
-            )
-            if result.get("uploaded", 0) > 0:
-                st.balloons()
-        else:
-            st.error("Sync failed.")
-        for e in (result.get("errors") or [])[:10]:
-            st.code(e)
-        for m in (result.get("messages") or [])[:10]:
-            st.info(m)
+        st.session_state.last_once_result = result
+        st.session_state.last_once_at = datetime.now().isoformat(timespec="seconds")
+    st.rerun()
 
 # Live status panel
 st.subheader("Runner status")
