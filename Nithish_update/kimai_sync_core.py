@@ -288,7 +288,38 @@ def resolve_project(excel_name: str, projects: list):
     return None, None
 
 
-def resolve_activity_id(url, token, project_id, preferred_name: str = "Design"):
+# Excel Tasks → Kimai project/activity (case-insensitive exact cell match).
+SPECIAL_TASK_ROUTING = {
+    "leave": {"project": "General Operations", "activity": "Leave"},
+    "permission": {"project": "General Operations", "activity": "Permission"},
+}
+
+
+def resolve_special_task_routing(task_text: str) -> dict | None:
+    """If Tasks is 'leave' or 'Permission', force General Operations + matching activity."""
+    key = " ".join(cell_text(task_text).lower().split())
+    mapped = SPECIAL_TASK_ROUTING.get(key)
+    return dict(mapped) if mapped else None
+
+
+def _activity_id_by_name(acts: list, name: str):
+    target = (name or "").strip().lower()
+    if not target:
+        return None
+    for a in acts:
+        if str(a.get("name", "")).strip().lower() == target:
+            return a.get("id")
+    return None
+
+
+def resolve_activity_id(
+    url,
+    token,
+    project_id,
+    preferred_name: str = "Design",
+    *,
+    strict: bool = False,
+):
     acts = fetch_kimai_activities(url, token, project_id) or []
     if not acts:
         acts = fetch_kimai_activities(url, token, None) or []
@@ -299,14 +330,23 @@ def resolve_activity_id(url, token, project_id, preferred_name: str = "Design"):
     pref = (preferred_name or "").strip()
     if pref:
         prefs.append(pref)
-    if "design" not in [p.lower() for p in prefs]:
+    if not strict and "design" not in [p.lower() for p in prefs]:
         prefs.append("Design")
 
     for name in prefs:
-        target = name.lower()
-        for a in acts:
-            if str(a.get("name", "")).strip().lower() == target:
-                return a["id"]
+        found = _activity_id_by_name(acts, name)
+        if found is not None:
+            return found
+
+    # Leave/Permission may be global activities not listed under the project.
+    if strict:
+        all_acts = fetch_kimai_activities(url, token, None) or []
+        for name in prefs:
+            found = _activity_id_by_name(all_acts, name)
+            if found is not None:
+                return found
+        return None
+
     return acts[0]["id"]
 
 
@@ -561,9 +601,41 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
             if duration <= 0:
                 duration = 8.0
 
-            excel_project = str(row.get("Project", "")).strip()
+            # Excel Tasks → Kimai Description (exact text from input file)
+            raw_task = cell_text(original_full_rows.at[idx, col_tasks])
+            if not raw_task:
+                raw_task = cell_text(row.get("_task_text") or row.get("Tasks"))
+            if not raw_task:
+                failed += 1
+                fail_details.append(f"Empty Tasks/description for date {day} — row skipped")
+                continue
+
+            special = resolve_special_task_routing(raw_task)
+            row_activity_name = activity_name
+            require_exact_activity = False
+            if special:
+                excel_project = special["project"]
+                row_activity_name = special["activity"]
+                require_exact_activity = True
+                note(
+                    f"Tasks '{raw_task}' → Kimai project '{excel_project}', "
+                    f"activity '{row_activity_name}'"
+                )
+            else:
+                excel_project = str(row.get("Project", "")).strip()
+
             proj_id, matched_name = resolve_project(excel_project, projects_data)
             if proj_id is None:
+                if special:
+                    failed += 1
+                    msg = (
+                        f"Kimai project '{excel_project}' not found "
+                        f"(required for Tasks '{raw_task}')."
+                    )
+                    fail_details.append(msg)
+                    if msg not in missing_project_msgs:
+                        missing_project_msgs.append(msg)
+                    continue
                 if allow_fallback_project:
                     proj_id = int(fallback_project_id)
                     matched_name = f"FALLBACK#{proj_id}"
@@ -579,12 +651,16 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
                     continue
 
             activity_id = resolve_activity_id(
-                kimai_url, kimai_token, proj_id, preferred_name=activity_name
+                kimai_url,
+                kimai_token,
+                proj_id,
+                preferred_name=row_activity_name,
+                strict=require_exact_activity,
             )
             if activity_id is None:
                 failed += 1
                 fail_details.append(
-                    f"No activity '{activity_name}' found for project '{matched_name}'."
+                    f"No activity '{row_activity_name}' found for project '{matched_name}'."
                 )
                 continue
 
@@ -595,19 +671,10 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
                 lunch_end=lunch_end if include_lunch_break else None,
             )
 
-            # Excel Tasks → Kimai Description (exact text from input file)
-            raw_task = cell_text(original_full_rows.at[idx, col_tasks])
-            if not raw_task:
-                raw_task = cell_text(row.get("_task_text") or row.get("Tasks"))
-            if not raw_task:
-                failed += 1
-                fail_details.append(f"Empty Tasks/description for date {day} — row skipped")
-                continue
-
-            # Default: exact Excel Tasks. Gemini only if checkbox enabled.
+            # Leave/Permission keep Excel text; Gemini only for normal tasks.
             final_task = (
                 polish_task_with_gemini(raw_task, gemini_key, True)
-                if use_gemini
+                if use_gemini and not special
                 else raw_task
             )
             # Safety: never allow Gemini/empty to wipe Tasks

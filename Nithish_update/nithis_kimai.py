@@ -22,6 +22,8 @@ from kimai_sync_core import (
     resolve_column,
     resolve_excel_path,
     resolve_project,
+    resolve_special_task_routing,
+    cell_text,
     run_sync,
     PERMISSION_HINT,
 )
@@ -226,7 +228,9 @@ st.header("2. Excel Paths (Input & Backup)")
 st.caption(
     "Excel **Tasks** → Kimai **Description**. "
     "**Ticket ID** is not used for Kimai (kept only in Backup). "
-    "Full input rows are joined into your **Backup** path after sync."
+    "Full input rows are joined into your **Backup** path after sync. "
+    "If Tasks is **leave**, Kimai uses project **General Operations** and activity **Leave**. "
+    "If Tasks is **Permission**, Kimai uses project **General Operations** and activity **Permission**."
 )
 col_p1, col_p2 = st.columns(2)
 with col_p1:
@@ -274,11 +278,26 @@ if resolved_input_path:
 
             matched_names = []
             matched_ids = []
+            matched_activities = []
+            missing_project_labels = []
             projects_series = (
                 input_df[col_project].tolist() if col_project else [""] * len(input_df)
             )
-            for p in projects_series:
-                pid, pname = resolve_project(p, projects_data)
+            tasks_series = input_df[col_tasks].tolist()
+            for p, task in zip(projects_series, tasks_series):
+                special = resolve_special_task_routing(cell_text(task))
+                if special:
+                    lookup_name = special["project"]
+                    pid, pname = resolve_project(lookup_name, projects_data)
+                    matched_activities.append(special["activity"])
+                    if pid is None:
+                        missing_project_labels.append(lookup_name)
+                else:
+                    lookup_name = p
+                    pid, pname = resolve_project(p, projects_data)
+                    matched_activities.append("—")
+                    if pid is None and str(p).strip():
+                        missing_project_labels.append(str(p).strip())
                 matched_ids.append(pid)
                 matched_names.append(pname if pname else "⚠ NOT FOUND")
 
@@ -289,6 +308,7 @@ if resolved_input_path:
                     "Tasks → Kimai Description": input_df[col_tasks],
                     "Hours Spent": input_df[col_hours] if col_hours else 8.0,
                     "Kimai Project": matched_names,
+                    "Kimai Activity": matched_activities,
                 }
             )
 
@@ -299,18 +319,13 @@ if resolved_input_path:
             st.caption(f"Kimai Description is taken from Excel column **{col_tasks}**.")
             st.dataframe(preview_df, height=180)
 
-            missing_projects = sorted(
-                {
-                    str(p).strip()
-                    for p, mid in zip(projects_series, matched_ids)
-                    if mid is None and str(p).strip()
-                }
-            )
+            missing_projects = sorted(set(missing_project_labels))
             if missing_projects:
                 st.error(
                     "Project value not found in Kimai:\n\n"
                     + "\n".join(f"- **{name}**" for name in missing_projects)
-                    + "\n\nCreate this project in Kimai, or fix the Excel **Project** name."
+                    + "\n\nCreate this project in Kimai, or fix the Excel **Project** name. "
+                    "Tasks **leave** / **Permission** always use **General Operations**."
                 )
             if projects_data:
                 with st.expander("Kimai projects (for matching)"):
