@@ -24,6 +24,10 @@ from kimai_sync_core import (
     resolve_project,
     resolve_special_task_routing,
     cell_text,
+    work_hours_from_value,
+    day_permission_balance_hours,
+    BALANCE_PERMISSION_PROJECT,
+    BALANCE_PERMISSION_ACTIVITY,
     run_sync,
     PERMISSION_HINT,
 )
@@ -230,7 +234,11 @@ st.caption(
     "**Ticket ID** is not used for Kimai (kept only in Backup). "
     "Full input rows are joined into your **Backup** path after sync. "
     "If Tasks is **leave**, Kimai uses project **General Operations** and activity **Leave**. "
-    "If Tasks is **Permission**, Kimai uses project **General Operations** and activity **Permission**."
+    "If Tasks is **Permission**, Kimai uses project **General Operations** and activity **Permission**. "
+    "If a weekday’s **Hours Spent** total is under **8**, the remaining hours are added as "
+    "**General Operations** / **Permission**. "
+    "Excel **Project** names match the Kimai project list ignoring capital letters and spaces "
+    "(e.g. `generaloperations` = `General Operations`)."
 )
 col_p1, col_p2 = st.columns(2)
 with col_p1:
@@ -311,6 +319,40 @@ if resolved_input_path:
                     "Kimai Activity": matched_activities,
                 }
             )
+            preview_hours = preview_df["Hours Spent"].map(work_hours_from_value)
+            preview_dates = pd.to_datetime(preview_df["Date"], errors="coerce").dt.date
+            balance_rows = []
+            for day_key, hour_total in preview_hours.groupby(preview_dates).sum().items():
+                if pd.isna(day_key):
+                    continue
+                try:
+                    if day_key.weekday() >= 5:
+                        continue
+                except AttributeError:
+                    continue
+                balance = day_permission_balance_hours(hour_total)
+                if balance <= 0:
+                    continue
+                pid, pname = resolve_project(BALANCE_PERMISSION_PROJECT, projects_data)
+                if pid is None:
+                    missing_project_labels.append(BALANCE_PERMISSION_PROJECT)
+                day_mask = preview_dates == day_key
+                sample_date = preview_df.loc[day_mask, "Date"].iloc[0]
+                balance_rows.append(
+                    {
+                        "Date": sample_date,
+                        "Project": "",
+                        "Tasks → Kimai Description": f"Permission (auto: +{balance:g}h to reach 8h)",
+                        "Hours Spent": balance,
+                        "Kimai Project": pname if pname else "⚠ NOT FOUND",
+                        "Kimai Activity": BALANCE_PERMISSION_ACTIVITY,
+                    }
+                )
+            if balance_rows:
+                preview_df = pd.concat(
+                    [preview_df, pd.DataFrame(balance_rows)],
+                    ignore_index=True,
+                )
 
             if is_http_url(input_excel_path):
                 st.success(f"SharePoint link → `{resolved_input_path}` ({len(input_df)} records).")

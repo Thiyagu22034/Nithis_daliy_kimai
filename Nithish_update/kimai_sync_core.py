@@ -250,37 +250,54 @@ def fetch_kimai_activities(url, token, project_id=None):
 
 
 def normalize_project_name(name: str) -> str:
-    s = str(name or "").strip().lower()
-    s = s.replace("&", " and ")
+    s = str(name or "").strip().casefold()
+    s = s.replace("\u00a0", " ").replace("&", " and ")
     s = re.sub(r"[^a-z0-9]+", " ", s)
     return " ".join(s.split())
 
 
+def project_match_key(name: str) -> str:
+    """Identity for matching: ignore case, spaces, punctuation (General Operations == generaloperations)."""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    s = str(name).casefold().replace("\u00a0", "").replace("&", "and")
+    if s.strip() in {"nan", "none", "nat"}:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
 def resolve_project(excel_name: str, projects: list):
     raw = str(excel_name or "").strip()
-    if not raw or not projects:
+    if raw.lower() in {"", "nan", "none", "nat"}:
+        return None, None
+    if not projects:
         return None, None
 
-    key = raw.lower()
-    norm = normalize_project_name(raw)
-    compact = norm.replace(" ", "")
+    excel_key = project_match_key(raw)
+    if not excel_key:
+        return None, None
 
+    compact_hits = []
     for p in projects:
-        if str(p.get("name", "")).strip().lower() == key:
-            return p["id"], p["name"]
+        pname = p.get("name", "")
+        if project_match_key(pname) == excel_key:
+            compact_hits.append(p)
+    if len(compact_hits) == 1:
+        return compact_hits[0]["id"], compact_hits[0]["name"]
+    if len(compact_hits) > 1:
+        folded = " ".join(raw.casefold().split())
+        for p in compact_hits:
+            if " ".join(str(p.get("name", "")).casefold().split()) == folded:
+                return p["id"], p["name"]
+        return compact_hits[0]["id"], compact_hits[0]["name"]
 
-    for p in projects:
-        pn = normalize_project_name(p.get("name", ""))
-        if pn == norm or pn.replace(" ", "") == compact:
-            return p["id"], p["name"]
-
+    # Last resort: exactly one Kimai name contains (or is contained by) the Excel name
     candidates = []
     for p in projects:
-        pn = normalize_project_name(p.get("name", ""))
-        pc = pn.replace(" ", "")
-        if not pn:
+        pk = project_match_key(p.get("name", ""))
+        if not pk:
             continue
-        if norm in pn or pn in norm or compact in pc or pc in compact:
+        if excel_key in pk or pk in excel_key:
             candidates.append(p)
     if len(candidates) == 1:
         return candidates[0]["id"], candidates[0]["name"]
@@ -293,6 +310,28 @@ SPECIAL_TASK_ROUTING = {
     "leave": {"project": "General Operations", "activity": "Leave"},
     "permission": {"project": "General Operations", "activity": "Permission"},
 }
+STANDARD_DAY_HOURS = 8.0
+BALANCE_PERMISSION_PROJECT = "General Operations"
+BALANCE_PERMISSION_ACTIVITY = "Permission"
+
+
+def work_hours_from_value(value) -> float:
+    hours = pd.to_numeric(value, errors="coerce")
+    if pd.isna(hours) or float(hours) <= 0:
+        return STANDARD_DAY_HOURS
+    return float(hours)
+
+
+def day_permission_balance_hours(total_hours: float) -> float:
+    """Hours still needed to reach an 8-hour day (0 if already 8+)."""
+    try:
+        total = float(total_hours)
+    except (TypeError, ValueError):
+        return 0.0
+    balance = STANDARD_DAY_HOURS - total
+    if balance <= 0.01:
+        return 0.0
+    return round(balance, 2)
 
 
 def resolve_special_task_routing(task_text: str) -> dict | None:
@@ -571,6 +610,39 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
             return False
         return "already have an entry" in (response.text or "").lower()
 
+    def post_intervals(intervals, proj_id, activity_id, description) -> bool:
+        """POST timesheet intervals. Returns True if none of the posts failed."""
+        nonlocal uploaded, skipped_existing, failed
+        row_failed = False
+        for begin_dt, end_dt in intervals:
+            payload = {
+                "begin": begin_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "end": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "project": proj_id,
+                "activity": activity_id,
+                "description": description,
+            }
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=10)
+                if res.status_code in [200, 201]:
+                    uploaded += 1
+                elif is_already_in_kimai(res):
+                    skipped_existing += 1
+                    skip_details.append(
+                        f"{begin_dt:%Y-%m-%d %H:%M}–{end_dt:%H:%M} already in Kimai (skipped)"
+                    )
+                else:
+                    failed += 1
+                    row_failed = True
+                    fail_details.append(
+                        f"{begin_dt:%Y-%m-%d %H:%M} → HTTP {res.status_code}: {res.text[:200]}"
+                    )
+            except Exception as e:
+                failed += 1
+                row_failed = True
+                fail_details.append(f"{begin_dt:%Y-%m-%d %H:%M} → {e}")
+        return not row_failed
+
     try:
         start_clock = parse_hhmm(work_start_time, "work day start time")
         lunch_delta = None
@@ -595,11 +667,17 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
         if include_lunch_break and lunch_clock and lunch_delta:
             lunch_start = datetime.combine(day, lunch_clock)
             lunch_end = lunch_start + lunch_delta
+        lunch_kw = {
+            "lunch_start": lunch_start if include_lunch_break else None,
+            "lunch_end": lunch_end if include_lunch_break else None,
+        }
+
+        day_success_indices = []
+        day_hours = 0.0
+        day_had_failure = False
 
         for idx, row in records.iterrows():
-            duration = float(row.get("Hours Spent", 8.0))
-            if duration <= 0:
-                duration = 8.0
+            duration = work_hours_from_value(row.get("Hours Spent", STANDARD_DAY_HOURS))
 
             # Excel Tasks → Kimai Description (exact text from input file)
             raw_task = cell_text(original_full_rows.at[idx, col_tasks])
@@ -607,6 +685,7 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
                 raw_task = cell_text(row.get("_task_text") or row.get("Tasks"))
             if not raw_task:
                 failed += 1
+                day_had_failure = True
                 fail_details.append(f"Empty Tasks/description for date {day} — row skipped")
                 continue
 
@@ -628,6 +707,7 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
             if proj_id is None:
                 if special:
                     failed += 1
+                    day_had_failure = True
                     msg = (
                         f"Kimai project '{excel_project}' not found "
                         f"(required for Tasks '{raw_task}')."
@@ -641,6 +721,7 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
                     matched_name = f"FALLBACK#{proj_id}"
                 else:
                     failed += 1
+                    day_had_failure = True
                     msg = (
                         f"Project value not found in Kimai: '{excel_project}' "
                         f"(date {pd.to_datetime(row.get('Date')).date() if pd.notna(row.get('Date')) else row.get('Date')})."
@@ -659,6 +740,7 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
             )
             if activity_id is None:
                 failed += 1
+                day_had_failure = True
                 fail_details.append(
                     f"No activity '{row_activity_name}' found for project '{matched_name}'."
                 )
@@ -667,8 +749,7 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
             intervals, current_cursor = place_work_intervals(
                 current_cursor,
                 duration,
-                lunch_start=lunch_start if include_lunch_break else None,
-                lunch_end=lunch_end if include_lunch_break else None,
+                **lunch_kw,
             )
 
             # Leave/Permission keep Excel text; Gemini only for normal tasks.
@@ -683,37 +764,64 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
 
             note(f"Kimai description ← Tasks: {final_task[:160]}")
 
-            row_failed = False
-            for begin_dt, end_dt in intervals:
-                payload = {
-                    "begin": begin_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "end": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "project": proj_id,
-                    "activity": activity_id,
-                    "description": final_task,  # Excel Tasks column only
-                }
-                try:
-                    res = requests.post(url, headers=headers, json=payload, timeout=10)
-                    if res.status_code in [200, 201]:
-                        uploaded += 1
-                    elif is_already_in_kimai(res):
-                        skipped_existing += 1
-                        skip_details.append(
-                            f"{begin_dt:%Y-%m-%d %H:%M}–{end_dt:%H:%M} already in Kimai (skipped)"
+            if post_intervals(intervals, proj_id, activity_id, final_task):
+                day_success_indices.append(idx)
+                day_hours += duration
+            else:
+                day_had_failure = True
+
+        # Short weekday: remaining hours → General Operations / Permission
+        if not day_had_failure:
+            balance = day_permission_balance_hours(day_hours)
+            if balance > 0:
+                perm_proj_id, perm_proj_name = resolve_project(
+                    BALANCE_PERMISSION_PROJECT, projects_data
+                )
+                if perm_proj_id is None:
+                    failed += 1
+                    day_had_failure = True
+                    msg = (
+                        f"Kimai project '{BALANCE_PERMISSION_PROJECT}' not found "
+                        f"(needed to fill {balance}h Permission on {day})."
+                    )
+                    fail_details.append(msg)
+                    if msg not in missing_project_msgs:
+                        missing_project_msgs.append(msg)
+                else:
+                    perm_act_id = resolve_activity_id(
+                        kimai_url,
+                        kimai_token,
+                        perm_proj_id,
+                        preferred_name=BALANCE_PERMISSION_ACTIVITY,
+                        strict=True,
+                    )
+                    if perm_act_id is None:
+                        failed += 1
+                        day_had_failure = True
+                        fail_details.append(
+                            f"No activity '{BALANCE_PERMISSION_ACTIVITY}' found for "
+                            f"project '{perm_proj_name}' (needed to fill {balance}h on {day})."
                         )
                     else:
-                        failed += 1
-                        row_failed = True
-                        fail_details.append(
-                            f"{begin_dt:%Y-%m-%d %H:%M} → HTTP {res.status_code}: {res.text[:200]}"
+                        perm_intervals, current_cursor = place_work_intervals(
+                            current_cursor,
+                            balance,
+                            **lunch_kw,
                         )
-                except Exception as e:
-                    failed += 1
-                    row_failed = True
-                    fail_details.append(f"{begin_dt:%Y-%m-%d %H:%M} → {e}")
+                        note(
+                            f"{day}: {day_hours:g}h in Excel, adding {balance:g}h "
+                            f"as {BALANCE_PERMISSION_PROJECT} / {BALANCE_PERMISSION_ACTIVITY}"
+                        )
+                        if not post_intervals(
+                            perm_intervals,
+                            perm_proj_id,
+                            perm_act_id,
+                            BALANCE_PERMISSION_ACTIVITY,
+                        ):
+                            day_had_failure = True
 
-            if not row_failed:
-                done_indices.append(idx)
+        if not day_had_failure:
+            done_indices.extend(day_success_indices)
 
     # Backup must store FULL input-file data (Email ID, Team, Ticket ID, etc.)
     df_done_full = original_full_rows.loc[original_full_rows.index.isin(done_indices)].copy()
