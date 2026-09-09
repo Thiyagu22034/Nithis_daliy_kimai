@@ -638,6 +638,96 @@ def fetch_kimai_activities(url, token, project_id=None):
         return []
 
 
+def fetch_kimai_timesheets(url, token, begin: datetime, end: datetime) -> list:
+    if not token or not url:
+        return []
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    endpoint = f"{url.rstrip('/')}/timesheets"
+    items: list = []
+    page = 1
+    while page <= 20:
+        try:
+            res = requests.get(
+                endpoint,
+                headers=headers,
+                params={
+                    "begin": begin.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "end": end.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "size": 100,
+                    "page": page,
+                },
+                timeout=20,
+            )
+        except Exception:
+            break
+        if res.status_code != 200:
+            break
+        try:
+            data = res.json()
+        except Exception:
+            break
+        if not isinstance(data, list) or not data:
+            break
+        items.extend(data)
+        if len(data) < 100:
+            break
+        page += 1
+    return items
+
+
+def task_match_key(text: str) -> str:
+    return " ".join(cell_text(text).casefold().split())
+
+
+def naive_datetime(value):
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    try:
+        if getattr(ts, "tzinfo", None) is not None:
+            ts = ts.tz_convert(None)
+    except (TypeError, ValueError, AttributeError):
+        try:
+            ts = ts.tz_localize(None)
+        except Exception:
+            pass
+    try:
+        return datetime(
+            int(ts.year), int(ts.month), int(ts.day),
+            int(ts.hour), int(ts.minute), int(ts.second),
+        )
+    except Exception:
+        return None
+
+
+def timesheet_date_key(begin_val) -> str:
+    s = str(begin_val or "")
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    dt = naive_datetime(begin_val)
+    return dt.strftime("%Y-%m-%d") if dt else ""
+
+
+def index_existing_timesheets(items: list) -> tuple[dict[str, set[str]], dict[str, datetime]]:
+    by_day: dict[str, set[str]] = {}
+    latest_end: dict[str, datetime] = {}
+    for ts in items or []:
+        if not isinstance(ts, dict):
+            continue
+        day_key = timesheet_date_key(ts.get("begin"))
+        if not day_key:
+            continue
+        key = task_match_key(ts.get("description"))
+        if key:
+            by_day.setdefault(day_key, set()).add(key)
+        end_dt = naive_datetime(ts.get("end"))
+        if end_dt:
+            prev = latest_end.get(day_key)
+            if prev is None or end_dt > prev:
+                latest_end[day_key] = end_dt
+    return by_day, latest_end
+
+
 def normalize_project_name(name: str) -> str:
     s = str(name or "").strip().casefold()
     s = s.replace("\u00a0", " ").replace("&", " and ")
@@ -990,6 +1080,19 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
     }
     url = f"{kimai_url.rstrip('/')}/timesheets"
 
+    existing_by_day: dict[str, set[str]] = {}
+    latest_end_by_day: dict[str, datetime] = {}
+    try:
+        min_day = pd.Timestamp(df_to_upload["Date"].min()).to_pydatetime()
+        max_day = pd.Timestamp(df_to_upload["Date"].max()).to_pydatetime()
+        fetch_begin = datetime.combine(min_day.date(), datetime.min.time())
+        fetch_end = datetime.combine(max_day.date() + timedelta(days=1), datetime.min.time())
+        existing_items = fetch_kimai_timesheets(kimai_url, kimai_token, fetch_begin, fetch_end)
+        existing_by_day, latest_end_by_day = index_existing_timesheets(existing_items)
+        note(f"Loaded {len(existing_items)} existing Kimai timesheet(s) to skip duplicates")
+    except Exception as e:
+        note(f"Could not list existing Kimai timesheets ({e}); will skip duplicates on POST")
+
     uploaded = skipped_weekend = skipped_existing = failed = 0
     fail_details = []
     skip_details = []
@@ -997,9 +1100,26 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
     done_indices = []
 
     def is_already_in_kimai(response) -> bool:
-        if response.status_code != 400:
+        if response.status_code not in (400, 409, 422):
             return False
-        return "already have an entry" in (response.text or "").lower()
+        text = (response.text or "").lower()
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                text += " " + str(body.get("message") or "").lower()
+                text += " " + str(body.get("errors") or "").lower()
+        except Exception:
+            pass
+        needles = (
+            "already have an entry",
+            "already have a timesheet",
+            "already exists",
+            "overlapping",
+            "overlap",
+            "duplicate",
+            "period is already",
+        )
+        return any(n in text for n in needles)
 
     def post_intervals(intervals, proj_id, activity_id, description) -> bool:
         """POST timesheet intervals. Returns True if none of the posts failed."""
@@ -1063,6 +1183,18 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
             "lunch_end": lunch_end if include_lunch_break else None,
         }
 
+        day_key = day.isoformat()
+        existing_keys = existing_by_day.setdefault(day_key, set())
+        kimai_end = latest_end_by_day.get(day_key)
+        used_kimai_cursor = False
+        if kimai_end and kimai_end.date() == day and kimai_end > current_cursor:
+            current_cursor = kimai_end
+            used_kimai_cursor = True
+            note(
+                f"{day}: existing Kimai work until {kimai_end:%H:%M}; "
+                "already-saved Excel rows are skipped and later rows continue after that"
+            )
+
         day_success_indices = []
         day_hours = 0.0
         day_had_failure = False
@@ -1078,6 +1210,23 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
                 failed += 1
                 day_had_failure = True
                 fail_details.append(f"Empty Tasks/description for date {day} — row skipped")
+                continue
+
+            task_key = task_match_key(raw_task)
+            if task_key and task_key in existing_keys:
+                skipped_existing += 1
+                day_success_indices.append(idx)
+                day_hours += duration
+                skip_details.append(
+                    f"{day}: already in Kimai — skipped '{raw_task[:120]}', next row"
+                )
+                note(f"{day}: Excel row already in Kimai, moving to next row: {raw_task[:120]}")
+                if not used_kimai_cursor:
+                    _, current_cursor = place_work_intervals(
+                        current_cursor,
+                        duration,
+                        **lunch_kw,
+                    )
                 continue
 
             special = resolve_special_task_routing(raw_task)
@@ -1158,6 +1307,8 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
             if post_intervals(intervals, proj_id, activity_id, final_task):
                 day_success_indices.append(idx)
                 day_hours += duration
+                if task_key:
+                    existing_keys.add(task_key)
             else:
                 day_had_failure = True
 
@@ -1211,8 +1362,8 @@ def run_sync(config: dict[str, Any], log: LogFn | None = None) -> dict[str, Any]
                         ):
                             day_had_failure = True
 
-        if not day_had_failure:
-            done_indices.extend(day_success_indices)
+        # Always clear handled rows (new uploads and already-in-Kimai), even if a later row failed
+        done_indices.extend(day_success_indices)
 
     # Backup must store FULL input-file data (Email ID, Team, Ticket ID, etc.)
     df_done_full = original_full_rows.loc[original_full_rows.index.isin(done_indices)].copy()

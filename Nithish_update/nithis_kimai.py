@@ -341,7 +341,8 @@ st.caption(
     "If a weekday’s **Hours Spent** total is under **8**, the remaining hours are added as "
     "**General Operations** / **Permission**. "
     "Excel **Project** names match the Kimai project list ignoring capital letters and spaces "
-    "(e.g. `generaloperations` = `General Operations`)."
+    "(e.g. `generaloperations` = `General Operations`). "
+    "If an Excel row is **already in Kimai**, it is skipped and the next row is processed."
 )
 col_p1, col_p2 = st.columns(2)
 with col_p1:
